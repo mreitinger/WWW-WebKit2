@@ -54,6 +54,8 @@ use Carp qw(carp croak);
 use XSLoader;
 use English '-no_match_vars';
 use POSIX qw<F_SETFD F_GETFD FD_CLOEXEC>;
+use IPC::Open3 qw/open3/;
+use Symbol 'gensym';
 
 our $VERSION = '0.111';
 
@@ -67,6 +69,11 @@ use constant ORDERED_NODE_SNAPSHOT_TYPE => 7;
 has xvfb => (
     is  => 'ro',
     isa => 'Bool',
+);
+
+has xvfb_pid => (
+    is  => 'rw',
+    isa => 'Int',
 );
 
 has view => (
@@ -424,39 +431,30 @@ sub handle_resource_request {
 sub setup_xvfb {
     my ($self) = @_;
 
-    # close STDERR to avoid Xvfb's noise
-    open my $stderr, '>&', \*STDERR or die "Can't dup STDERR: $!";
-    close STDERR;
-
-    if (system('Xvfb -help') != 0) {
-        open STDERR, '>&', $stderr;
-        die 'Could not start Xvfb';
-    }
-
-    # restore STDERR
-    open STDERR, '>&', $stderr or die "Can't open STDERR: $!";;
-
-    pipe my $read, my $write;
-    my $writefd = fileno $write;
-
-    # prevent pipe FD from being closed on exec when starting Xvfb:
-    $SYSTEM_FD_MAX = $writefd;
-    my $flags = fcntl $write, F_GETFD, 0;
-    $flags &= ~FD_CLOEXEC;
-    fcntl $write, F_SETFD, $flags;
-
-    open STDERR, '>', '/dev/null' or die "Cant' open STDERR: $!";
-
     my $screen_dimensions = join 'x', $self->window_width, $self->window_height, 24;
-    system ("Xvfb -nolisten tcp -terminate -screen 0 $screen_dimensions -displayfd $writefd &");
 
-    open STDERR, '>&', $stderr or die "Can't open STDERR: $!";
+    my $xvfb_pid = open3(
+        my $fh_in,  # STDIN
+        my $fh_out, # STDOUT for capturing result of command
+        my $fh_err = gensym, # STDERR for capturing errors
 
-    # Xvfb prints the display number newline terminated to our pipe
-    my $display = <$read>;
-    chomp $display;
+        "Xvfb", "-terminate", "-screen", "0", $screen_dimensions, "-displayfd", 1, "-nolisten", "tcp"
+    );
 
-    $ENV{DISPLAY} = ":$display";
+    #displayfd 1 instructs Xvfb to find a free display number and output 
+    #it to STDOUT. we expect just this number and nothing else.
+    while(<$fh_out>) {
+        chomp;
+
+        if($_ =~ m/^(\d+)$/) {
+            $ENV{DISPLAY} = ":$1";
+            $self->xvfb_pid($xvfb_pid);
+            last;
+        } else {
+            print STDERR "Unable to determine display.\n";
+            exit 1;
+        }
+    }
 
     return;
 }
@@ -508,6 +506,8 @@ sub DESTROY {
     my ($self) = @_;
 
     $self->uninit;
+
+    kill('SIGTERM', $self->xvfb_pid) if $self->xvfb_pid;
 }
 
 1;
